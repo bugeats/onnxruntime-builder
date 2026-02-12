@@ -1,0 +1,42 @@
+--- a/onnxruntime/core/providers/shared/common.cc	2026-02-12 17:30:22.699862074 -0800
++++ b/onnxruntime/core/providers/shared/common.cc	2026-02-12 17:30:22.700862088 -0800
+@@ -2,13 +2,36 @@
+ // Licensed under the MIT License.
+ 
+ #include "common.h"
++#include <atomic>
+ 
+-onnxruntime::ProviderHost* g_host{};
++// For static builds: forward declaration of function that returns the ProviderHostImpl
++// Defined in provider_bridge_ort.cc - uses Meyers Singleton for thread safety
++namespace onnxruntime {
++  ProviderHost* GetStaticProviderHost();
++}
++
++// Atomic pointer - may be set by Provider_SetHost (shared library case)
++// or we fall back to GetStaticProviderHost (static linking case)
++static std::atomic<onnxruntime::ProviderHost*> g_host{nullptr};
++
++// Thread-local flag to detect recursive calls during ProviderHostImpl construction
++static thread_local bool g_in_init = false;
+ 
+ onnxruntime::ProviderHost* Provider_GetHost() {
+-  return g_host;
++  onnxruntime::ProviderHost* host = g_host.load(std::memory_order_acquire);
++  if (host != nullptr) {
++    return host;
++  }
++  // Prevent infinite recursion if ProviderHostImpl construction calls Provider_GetHost
++  if (g_in_init) {
++    return onnxruntime::GetStaticProviderHost();
++  }
++  g_in_init = true;
++  host = onnxruntime::GetStaticProviderHost();
++  g_in_init = false;
++  return host;
+ }
+ 
+ void Provider_SetHost(onnxruntime::ProviderHost* p) {
+-  g_host = p;
++  g_host.store(p, std::memory_order_release);
+ }

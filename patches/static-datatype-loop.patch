@@ -1,0 +1,23 @@
+--- a/onnxruntime/core/providers/shared_library/provider_bridge_provider.cc
++++ b/onnxruntime/core/providers/shared_library/provider_bridge_provider.cc
+@@ -122,6 +122,11 @@ void RunOnUnload(std::function<void()> function) {
+   s_run_on_unload_->push_back(function);
+ }
+
++// In static builds, these template specializations conflict with the ones in data_types.cc
++// and create an infinite loop: GetType<T>() -> Provider_GetHost()->DataTypeImpl__GetType_T()
++// -> GetType<T>() (back to the start). Skip them for static linking.
++#ifndef ORT_STATIC_PROVIDERS
++
+ template <>
+ MLDataType DataTypeImpl::GetType<Tensor>() { return Provider_GetHost()->DataTypeImpl__GetType_Tensor(); }
+ #if !defined(DISABLE_SPARSE_TENSORS)
+@@ -258,6 +263,8 @@ MLDataType DataTypeImpl::GetSparseTensorType<Float8E5M2FNUZ>() { return Provider
+
+ #endif
+
++#endif  // ORT_STATIC_PROVIDERS
++
+ Status IDataTransfer::CopyTensor(const Tensor& src, Tensor& dst) const {
+   return g_host->IDataTransfer__CopyTensor(this, src, dst);
+ }

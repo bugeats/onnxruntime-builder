@@ -1,0 +1,32 @@
+--- a/onnxruntime/core/session/provider_bridge_ort.cc
++++ b/onnxruntime/core/session/provider_bridge_ort.cc
+@@ -1745,7 +1745,19 @@
+ #if !defined(ORT_MINIMAL_BUILD) || defined(ORT_MINIMAL_BUILD_CUSTOM_OPS)
+   Status LoadDynamicLibrary(onnxruntime::PathString library_name) override { return LoadDynamicLibraryFromProvider(library_name); };
+ #endif
+-} provider_host_;
++};
++
++// Meyers Singleton: guarantees initialization on first use, not during static init
++// This avoids static initialization order issues in static linking
++static ProviderHostImpl& GetProviderHostImpl() {
++  static ProviderHostImpl instance;
++  return instance;
++}
++
++// For static linking: called from Provider_GetHost() in common.cc
++ProviderHost* GetStaticProviderHost() {
++  return &GetProviderHostImpl();
++}
+ 
+ #if defined(_MSC_VER) && !defined(__clang__)
+ #pragma warning(pop)
+@@ -1762,7 +1774,7 @@
+     void (*PProvider_SetHost)(void*);
+     ORT_THROW_IF_ERROR(Env::Default().GetSymbolFromLibrary(handle_, "Provider_SetHost", (void**)&PProvider_SetHost));
+ 
+-    PProvider_SetHost(&provider_host_);
++    PProvider_SetHost(&GetProviderHostImpl());
+   }
+ 
+   void Unload() {

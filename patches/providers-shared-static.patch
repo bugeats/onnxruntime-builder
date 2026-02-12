@@ -1,0 +1,45 @@
+--- a/cmake/onnxruntime_providers_cpu.cmake	2026-02-11 16:51:39.688831650 -0800
++++ b/cmake/onnxruntime_providers_cpu.cmake	2026-02-11 16:51:59.974054958 -0800
+@@ -217,39 +217,11 @@
+   )
+ 
+   source_group(TREE ${ONNXRUNTIME_ROOT}/core FILES ${onnxruntime_providers_shared_cc_srcs})
+-  onnxruntime_add_shared_library(onnxruntime_providers_shared ${onnxruntime_providers_shared_cc_srcs} "${ONNXRUNTIME_ROOT}/core/dll/onnxruntime.rc")
++  onnxruntime_add_static_library(onnxruntime_providers_shared ${onnxruntime_providers_shared_cc_srcs})
+   set_target_properties(onnxruntime_providers_shared PROPERTIES FOLDER "ONNXRuntime")
+   set_target_properties(onnxruntime_providers_shared PROPERTIES LINKER_LANGUAGE CXX)
+-  #ON AIX, to call dlopen on onnxruntime_providers_shared, we need to generate this library as shared object .so file.
+-  #Latest cmake behavior is changed and  cmake will remove shared object .so file after generating the shared archive.
+-  #To prevent that, making AIX_SHARED_LIBRARY_ARCHIVE as OFF for onnxruntime_providers_shared.
+-  if (CMAKE_SYSTEM_NAME MATCHES "AIX")
+-    set_target_properties(onnxruntime_providers_shared PROPERTIES AIX_SHARED_LIBRARY_ARCHIVE OFF)
+-  endif()
+-
+-  target_compile_definitions(onnxruntime_providers_shared PRIVATE FILE_NAME=\"onnxruntime_providers_shared.dll\")
+-
+-
+-  # On Apple/Unix we don't directly link with this library as we load it with RTLD_GLOBAL, so this is only set to the actual library on WIN32
+-  # But, in exchange we need to manually add Boost::mp11 to include dirs for every EP.
+-  # It is because "provider_api.h" includes core/framework/op_kernel.h which includes op_kernel.h which includes "boost/mp11.hpp"
+-  set(ONNXRUNTIME_PROVIDERS_SHARED)
+-
+-  if(APPLE)
+-  set_property(TARGET onnxruntime_providers_shared APPEND_STRING PROPERTY LINK_FLAGS "-Xlinker -exported_symbols_list ${ONNXRUNTIME_ROOT}/core/providers/shared/exported_symbols.lst")
+-  elseif(UNIX)
+-    if(NOT CMAKE_SYSTEM_NAME MATCHES "AIX")
+-      target_link_options(onnxruntime_providers_shared PRIVATE
+-                          "LINKER:--version-script=${ONNXRUNTIME_ROOT}/core/providers/shared/version_script.lds"
+-                          "LINKER:--gc-sections")
+-    endif()
+-  elseif(WIN32)
+-  set_property(TARGET onnxruntime_providers_shared APPEND_STRING PROPERTY LINK_FLAGS "-DEF:${ONNXRUNTIME_ROOT}/core/providers/shared/symbols.def")
+-  set(ONNXRUNTIME_PROVIDERS_SHARED onnxruntime_providers_shared)
+-  else()
+-  message(FATAL_ERROR "onnxruntime_providers_shared unknown platform, need to specify shared library exports for it")
+-  endif()
+-
++  # For static builds, always set ONNXRUNTIME_PROVIDERS_SHARED so providers can link against it
++  set(ONNXRUNTIME_PROVIDERS_SHARED onnxruntime_providers_shared PARENT_SCOPE)
+   install(TARGETS onnxruntime_providers_shared
+           ARCHIVE  DESTINATION ${CMAKE_INSTALL_LIBDIR}
+           LIBRARY  DESTINATION ${CMAKE_INSTALL_LIBDIR}

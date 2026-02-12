@@ -1,0 +1,17 @@
+--- a/onnxruntime/core/providers/cpu/cpu_provider_shared.cc
++++ b/onnxruntime/core/providers/cpu/cpu_provider_shared.cc
+@@ -362,8 +362,11 @@
+ #pragma warning(pop)
+ #endif
+ 
+-// We don't new this type on heap, so it's ok to not have a virtual destructor.
+-ProviderHostCPUImpl provider_host_cpu_;
+-ProviderHostCPU& GetProviderHostCPU() { return provider_host_cpu_; }
++// Meyers Singleton: guarantees initialization on first use, not during static init
++// This avoids static initialization order issues in static linking
++ProviderHostCPU& GetProviderHostCPU() {
++  static ProviderHostCPUImpl provider_host_cpu_;
++  return provider_host_cpu_;
++}
+ 
+ }  // namespace onnxruntime

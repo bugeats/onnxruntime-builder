@@ -1,0 +1,23 @@
+--- a/onnxruntime/core/providers/shared_library/provider_bridge_provider.cc
++++ b/onnxruntime/core/providers/shared_library/provider_bridge_provider.cc
+@@ -364,6 +364,11 @@ CPUIDInfo::CPUIDInfo() {
+ bool CPUIDInfo::HasAVX512Skylake() const { return g_host->CPUIDInfo__HasAVX512Skylake(this); }
+ #endif
+
++// In static builds, these TensorShape methods create infinite loops:
++// TensorShape::Allocate() -> g_host->TensorShape__Allocate() -> TensorShape::Allocate()
++// Skip them for static linking - the linker will use the real implementations.
++#ifndef ORT_STATIC_PROVIDERS
++
+ TensorShape::TensorShape(gsl::span<const int64_t> dims) {
+   Allocate(dims.size());
+   gsl::copy(dims, values_);
+@@ -420,6 +425,8 @@ std::string TensorShape::ToString() const { return g_host->TensorShape__ToString
+ int64_t TensorShape::SizeToDimension(size_t dimension) const { return g_host->TensorShape__SizeToDimension(this, dimension); }
+ int64_t TensorShape::SizeFromDimension(size_t dimension) const { return g_host->TensorShape__SizeFromDimension(this, dimension); }
+
++#endif  // ORT_STATIC_PROVIDERS
++
+ std::ostream& operator<<(std::ostream& out, const TensorShape& shape) { return g_host->operator_left_shift(out, shape); }
+
+ AllocatorPtr CreateAllocator(const AllocatorCreationInfo& info) {

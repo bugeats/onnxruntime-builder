@@ -1,0 +1,55 @@
+--- a/cmake/onnxruntime_providers_cuda.cmake	2026-02-11 16:49:17.267264747 -0800
++++ b/cmake/onnxruntime_providers_cuda.cmake	2026-02-11 16:51:03.291431036 -0800
+@@ -137,7 +137,7 @@
+       list(APPEND onnxruntime_providers_cuda_all_srcs "${ONNXRUNTIME_ROOT}/core/providers/cuda/onnxruntime_providers_cuda.rc")
+     endif()
+ 
+-    onnxruntime_add_shared_library_module(onnxruntime_providers_cuda ${onnxruntime_providers_cuda_all_srcs}
++    onnxruntime_add_static_library(onnxruntime_providers_cuda ${onnxruntime_providers_cuda_all_srcs}
+                                                                      $<TARGET_OBJECTS:onnxruntime_providers_cuda_obj>)
+   else()
+     set(onnxruntime_providers_cuda_all_srcs ${onnxruntime_providers_cuda_src})
+@@ -146,7 +146,7 @@
+       list(APPEND onnxruntime_providers_cuda_all_srcs "${ONNXRUNTIME_ROOT}/core/providers/cuda/onnxruntime_providers_cuda.rc")
+     endif()
+ 
+-    onnxruntime_add_shared_library_module(onnxruntime_providers_cuda ${onnxruntime_providers_cuda_all_srcs})
++    onnxruntime_add_static_library(onnxruntime_providers_cuda ${onnxruntime_providers_cuda_all_srcs})
+   endif()
+ 
+   if(WIN32)
+@@ -237,7 +237,15 @@
+           message( WARNING "To compile with NHWC ops enabled please compile against cuDNN 9 or newer." )
+         endif()
+       endif()
+-      target_link_libraries(${target} PRIVATE CUDA::cublasLt CUDA::cublas CUDNN::cudnn_all cudnn_frontend CUDA::curand CUDA::cufft CUDA::cudart
++      # Static CUDA libraries - note: cudnn remains shared as no static version exists
++      # culibos is optional - nixpkgs may not provide it separately
++      set(_cuda_static_libs CUDA::cublasLt_static CUDA::cublas_static CUDA::curand_static CUDA::cufft_static_nocallback CUDA::cudart_static)
++      if(TARGET CUDA::culibos)
++        list(APPEND _cuda_static_libs CUDA::culibos)
++      endif()
++      target_link_libraries(${target} PRIVATE
++              ${_cuda_static_libs}
++              CUDNN::cudnn_all cudnn_frontend
+               ${ABSEIL_LIBS} ${ONNXRUNTIME_PROVIDERS_SHARED} Boost::mp11 safeint_interface)
+     endif()
+ 
+@@ -298,15 +306,8 @@
+           STATIC_LIBRARY_FLAGS "${onnxruntime_providers_cuda_static_library_flags}")
+     endif()
+ 
+-    if(APPLE)
+-      set_property(TARGET ${target} APPEND_STRING PROPERTY LINK_FLAGS "-Xlinker -exported_symbols_list ${ONNXRUNTIME_ROOT}/core/providers/cuda/exported_symbols.lst")
+-    elseif(UNIX)
+-      set_property(TARGET ${target} APPEND_STRING PROPERTY LINK_FLAGS "-Xlinker --version-script=${ONNXRUNTIME_ROOT}/core/providers/cuda/version_script.lds -Xlinker --gc-sections")
+-    elseif(WIN32)
+-      set_property(TARGET ${target} APPEND_STRING PROPERTY LINK_FLAGS "-DEF:${ONNXRUNTIME_ROOT}/core/providers/cuda/symbols.def")
+-    else()
+-      message(FATAL_ERROR "${target} unknown platform, need to specify shared library exports for it")
+-    endif()
++    # Removed shared library export flags (version_script.lds, exported_symbols.lst, symbols.def)
++    # as we're now building a static library
+ 
+     if (onnxruntime_ENABLE_ATEN)
+       target_compile_definitions(${target} PRIVATE ENABLE_ATEN)

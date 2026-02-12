@@ -1,0 +1,37 @@
+--- a/onnxruntime/core/providers/shared_library/provider_bridge_provider.cc
++++ b/onnxruntime/core/providers/shared_library/provider_bridge_provider.cc
+@@ -81,16 +81,24 @@
+ #endif
+
+ namespace onnxruntime {
+-#if defined(_MSC_VER) && !defined(__clang__)
+-#pragma warning(push)
+-// "Global initializer calls a non-constexpr function."
+-#pragma warning(disable : 26426)
+-#endif
+-ProviderHost* g_host = Provider_GetHost();
+-ProviderHostCPU& g_host_cpu = g_host->GetProviderHostCPU();
+-#if defined(_MSC_VER) && !defined(__clang__)
+-#pragma warning(pop)
+-#endif
++// Meyers Singleton getters: guarantee thread-safe initialization on first use
++// This avoids static initialization order issues when statically linking
++static ProviderHost* GetGHostImpl() {
++  // Provider_GetHost() (patched in common.cc) handles lazy initialization
++  // via GetStaticProviderHost() if g_host hasn't been set yet
++  static ProviderHost* host = Provider_GetHost();
++  return host;
++}
++static ProviderHostCPU& GetGHostCPUImpl() {
++  static ProviderHostCPU& host_cpu = GetGHostImpl()->GetProviderHostCPU();
++  return host_cpu;
++}
++
++// IMPORTANT: Define actual symbols for external linkage
++// Other translation units (via provider_wrappedtypes.h) declare these as extern
++// and expect to link against them. Initialize via Meyers Singleton getters.
++ProviderHost* g_host = GetGHostImpl();
++ProviderHostCPU& g_host_cpu = GetGHostCPUImpl();
+ static std::unique_ptr<std::vector<std::function<void()>>> s_run_on_unload_;
+
+ void RunOnUnload(std::function<void()> function) {

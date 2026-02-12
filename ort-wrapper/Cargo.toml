@@ -1,0 +1,39 @@
+[package]
+name = "ort-wrapper"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[features]
+# Accelerator features - enable at most one
+# These enable the corresponding ort feature AND the Rust code paths
+cuda = ["ort/cuda"]
+coreml = ["ort/coreml"]
+# Dynamic CUDA linking - uses shared libonnxruntime.so instead of static archives
+# Enables `cuda` feature for runtime detection while using different linking strategy
+cuda-dyn = ["cuda"]
+
+[build-dependencies]
+# No build dependencies - we handle all linking ourselves
+
+[dependencies]
+ndarray = "0.16"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Base ort dependency - accelerator features added via Cargo features above
+# - "alternative-backend" disables ort-sys linking (we do it ourselves)
+ort = { version = "=2.0.0-rc.11", default-features = false, features = [
+    "std",
+    "ndarray",
+    "alternative-backend",
+] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+test-log = { version = "0.2", features = ["trace"] }
+
+[[bench]]
+name = "inference"
+harness = false

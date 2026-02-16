@@ -201,7 +201,14 @@
           # - onnxruntime-coreml: static CoreML (default on macOS)
           pname =
             "onnxruntime"
-            + (if useCuda then "-cuda" else if useCoreml then "-coreml" else "-cpu")
+            + (
+              if useCuda then
+                "-cuda"
+              else if useCoreml then
+                "-coreml"
+              else
+                "-cpu"
+            )
             + (if buildShared then "-dyn" else "");
           version = onnxruntimeVersion;
 
@@ -478,7 +485,9 @@
           };
 
           meta = {
-            description = "ONNX Runtime library (${acceleratorName}, ${if buildShared then "dynamic" else "static"} linking)";
+            description = "ONNX Runtime library (${acceleratorName}, ${
+              if buildShared then "dynamic" else "static"
+            } linking)";
             homepage = "https://github.com/microsoft/onnxruntime";
             license = lib.licenses.mit;
             platforms = [ system ];
@@ -721,18 +730,15 @@
               null;
 
           envDefault = mkOrtWrapperEnv {
-            inherit
-              pkgs
-              system
-              onnxruntime
-              squeezenet-model
-              ;
+            inherit pkgs system squeezenet-model;
             inherit (defaultAccel) useCuda useCoreml;
+            onnxruntime = onnxruntimeCpu;
           };
+
           envCpu = mkOrtWrapperEnv {
             inherit pkgs system squeezenet-model;
-            onnxruntime = onnxruntimeCpu;
             inherit (cpuAccel) useCuda useCoreml;
+            onnxruntime = onnxruntimeCpu;
           };
 
           mkApp =
@@ -902,17 +908,15 @@
             ];
             inherit (ctx.envCudaDyn) buildInputs;
             inherit (ctx.envCudaDyn.envVars) ORT_DYLIB_PATH ONNX_TEST_MODEL;
-            shellHook =
-              ctx.envCudaDyn.shellHook
-              + ''
-                echo "ONNX Runtime development shell (Dynamic CUDA)"
-                echo "  ORT_DYLIB_PATH: $ORT_DYLIB_PATH"
-                echo "  ONNX_TEST_MODEL: $ONNX_TEST_MODEL"
-                echo ""
-                echo "Commands:"
-                echo "  cd ort-wrapper && cargo build --features cuda-dyn    # Build"
-                echo "  cd ort-wrapper && cargo test --features cuda-dyn     # Run tests"
-              '';
+            shellHook = ctx.envCudaDyn.shellHook + ''
+              echo "ONNX Runtime development shell (Dynamic CUDA)"
+              echo "  ORT_DYLIB_PATH: $ORT_DYLIB_PATH"
+              echo "  ONNX_TEST_MODEL: $ONNX_TEST_MODEL"
+              echo ""
+              echo "Commands:"
+              echo "  cd ort-wrapper && cargo build --features cuda-dyn    # Build"
+              echo "  cd ort-wrapper && cargo test --features cuda-dyn     # Run tests"
+            '';
           };
         }
       );

@@ -389,9 +389,8 @@
             mkdir -p $out/lib/cudnn
             cp -L ${cudaPackages.cudnn.lib}/lib/libcudnn*.so* $out/lib/cudnn/ || true
           ''
-          # Static CUDA build: device linking and archive merging
+          # CUDA device linking: separable compilation (-dc) requires nvcc -dlink
           + lib.optionalString (useCuda && !buildShared) ''
-            # Device linking: ORT uses separable compilation (-dc) which requires nvcc -dlink
             DLINK_DIR=$(mktemp -d)
             pushd $DLINK_DIR
             ${pkgs.binutils}/bin/ar x $out/lib/libonnxruntime_providers_cuda.a
@@ -409,51 +408,19 @@
             fi
             popd
             rm -rf $DLINK_DIR
-
-            # Merge all static libraries into unified archive
+          ''
+          # Merge component archives into unified libonnxruntime.a
+          # Glob discovers which components exist — works for both CUDA and CPU
+          + lib.optionalString (isLinux && !buildShared) ''
             pushd $out/lib
-            cat > merge.mri << 'MRIEOF'
-            CREATE libonnxruntime.a
-            ADDLIB libonnxruntime_common.a
-            ADDLIB libonnxruntime_flatbuffers.a
-            ADDLIB libonnxruntime_framework.a
-            ADDLIB libonnxruntime_graph.a
-            ADDLIB libonnxruntime_lora.a
-            ADDLIB libonnxruntime_mlas.a
-            ADDLIB libonnxruntime_optimizer.a
-            ADDLIB libonnxruntime_providers.a
-            ADDLIB libonnxruntime_providers_shared.a
-            ADDLIB libonnxruntime_providers_cuda.a
-            ADDLIB libonnxruntime_session.a
-            ADDLIB libonnxruntime_util.a
-            SAVE
-            END
-            MRIEOF
+            echo "CREATE libonnxruntime.a" > merge.mri
+            for f in libonnxruntime_*.a; do
+              echo "ADDLIB $f" >> merge.mri
+            done
+            echo "SAVE" >> merge.mri
+            echo "END" >> merge.mri
             ${pkgs.binutils}/bin/ar -M < merge.mri
             [ -f cuda_device_link.o ] && ${pkgs.binutils}/bin/ar r libonnxruntime.a cuda_device_link.o
-            ${pkgs.binutils}/bin/ranlib libonnxruntime.a
-            rm merge.mri
-            popd
-          ''
-          # CPU-only static: merge without CUDA provider libraries
-          + lib.optionalString (isLinux && !useCuda && !buildShared) ''
-            pushd $out/lib
-            cat > merge.mri << 'MRIEOF'
-            CREATE libonnxruntime.a
-            ADDLIB libonnxruntime_common.a
-            ADDLIB libonnxruntime_flatbuffers.a
-            ADDLIB libonnxruntime_framework.a
-            ADDLIB libonnxruntime_graph.a
-            ADDLIB libonnxruntime_lora.a
-            ADDLIB libonnxruntime_mlas.a
-            ADDLIB libonnxruntime_optimizer.a
-            ADDLIB libonnxruntime_providers.a
-            ADDLIB libonnxruntime_session.a
-            ADDLIB libonnxruntime_util.a
-            SAVE
-            END
-            MRIEOF
-            ${pkgs.binutils}/bin/ar -M < merge.mri
             ${pkgs.binutils}/bin/ranlib libonnxruntime.a
             rm merge.mri
             popd
@@ -671,17 +638,7 @@
                 ORT_DYLIB_PATH = "${onnxruntimeCudaDyn}/lib";
                 ONNX_TEST_MODEL = squeezenet-model;
                 nativeBuildInputs = [ pkgs.pkg-config ];
-                buildInputs = [
-                  onnxruntimeCudaDyn
-                  pkgs.protobuf
-                  pkgs.re2
-                  cudaPackages.cudnn
-                  cudaPackages.cuda_cudart
-                  cudaPackages.libcublas
-                  cudaPackages.libcurand
-                  cudaPackages.libcusparse
-                  cudaPackages.libcufft
-                ];
+                inherit (envCudaDyn) buildInputs;
                 doCheck = false;
 
                 meta = {
@@ -825,6 +782,7 @@
             envDefault
             envCpu
             envCudaDyn
+            devPackages
             mkApp
             mkDevShell
             ;
@@ -900,12 +858,7 @@
           };
           cuda-dyn = pkgs.mkShell {
             name = "onnxruntime-dev-cuda-dyn";
-            packages = [
-              pkgs.cargo
-              pkgs.rustc
-              pkgs.rust-analyzer
-              pkgs.pkg-config
-            ];
+            packages = ctx.devPackages;
             inherit (ctx.envCudaDyn) buildInputs;
             inherit (ctx.envCudaDyn.envVars) ORT_DYLIB_PATH ONNX_TEST_MODEL;
             shellHook = ctx.envCudaDyn.shellHook + ''
@@ -963,18 +916,21 @@
                 export ONNX_TEST_MODEL="${ctx.squeezenet-model}"
                 echo "=== Static CUDA Backtrace (auto-interrupt after ''${DELAY}s) ==="
                 echo ""
-                # Start GDB in background, get its PID, send SIGINT after delay
+
+                # Self-interrupt technique: fork a process that sends SIGINT after delay
+                SELF=$$
+                ( sleep "$DELAY" ; kill -INT $SELF ) &
+                KILLER=$!
+
                 ${pkgs.gdb}/bin/gdb \
                   -ex "set pagination off" \
                   -ex "run" \
                   -ex "bt" \
                   -ex "thread apply all bt" \
                   -ex "quit" \
-                  "${ctx.ortWrapperDefault}/bin/ort-wrapper" &
-                GDB_PID=$!
-                sleep "$DELAY"
-                kill -INT $GDB_PID 2>/dev/null || true
-                wait $GDB_PID 2>/dev/null
+                  "${ctx.ortWrapperDefault}/bin/ort-wrapper"
+
+                kill $KILLER 2>/dev/null || true
               '';
             in
             {
@@ -988,10 +944,14 @@
               wrapper = pkgs.writeShellScriptBin "debug-ort-gdb" ''
                 export LD_LIBRARY_PATH="${ctx.envDefault.cudnnLibPath}:''${LD_LIBRARY_PATH:-}"
                 export ONNX_TEST_MODEL="${ctx.squeezenet-model}"
-                echo "=== Static CUDA GDB Session ==="
-                echo "When it hangs, press Ctrl+C then: bt, thread apply all bt"
+                echo "=== Static CUDA Debug Session ==="
+                echo "When it hangs, press Ctrl+C then type:"
+                echo "  bt        - show backtrace"
+                echo "  bt full   - show backtrace with locals"
+                echo "  info threads - list all threads"
+                echo "  thread N  - switch to thread N"
                 echo ""
-                exec ${pkgs.gdb}/bin/gdb -ex "set pagination off" -ex run "${ctx.ortWrapperDefault}/bin/ort-wrapper"
+                exec ${pkgs.gdb}/bin/gdb -ex "set pagination off" -ex run --args "${ctx.ortWrapperDefault}/bin/ort-wrapper" "$@"
               '';
             in
             {
@@ -1035,29 +995,6 @@
           ctx = mkSystemContext { inherit pkgs system; };
         in
         ctx.lib.optionalAttrs ctx.isLinux {
-          # Run static CUDA wrapper under GDB
-          # Usage: nix run .#debug.gdb-cuda
-          # When it hangs, press Ctrl+C then type "bt" for backtrace
-          gdb-cuda =
-            let
-              wrapper = pkgs.writeShellScriptBin "debug-ort-gdb" ''
-                export LD_LIBRARY_PATH="${ctx.envDefault.cudnnLibPath}:''${LD_LIBRARY_PATH:-}"
-                export ONNX_TEST_MODEL="${ctx.squeezenet-model}"
-                echo "=== Static CUDA Debug Session ==="
-                echo "When it hangs, press Ctrl+C then type:"
-                echo "  bt        - show backtrace"
-                echo "  bt full   - show backtrace with locals"
-                echo "  info threads - list all threads"
-                echo "  thread N  - switch to thread N"
-                echo ""
-                exec ${pkgs.gdb}/bin/gdb -ex "set pagination off" -ex run --args "${ctx.ortWrapperDefault}/bin/ort-wrapper" "$@"
-              '';
-            in
-            {
-              type = "app";
-              program = "${wrapper}/bin/debug-ort-gdb";
-            };
-
           # Run static CUDA wrapper under strace to see syscalls
           # Usage: nix run .#debug.strace-cuda
           strace-cuda =
@@ -1125,38 +1062,6 @@
               program = "${wrapper}/bin/debug-ort-spin";
             };
 
-          # Auto-interrupt GDB - runs for N seconds then captures backtrace
-          # Usage: nix run .#debug.bt-cuda [seconds]
-          bt-cuda =
-            let
-              wrapper = pkgs.writeShellScriptBin "debug-ort-bt" ''
-                DELAY=''${1:-2}
-                export LD_LIBRARY_PATH="${ctx.envDefault.cudnnLibPath}:''${LD_LIBRARY_PATH:-}"
-                export ONNX_TEST_MODEL="${ctx.squeezenet-model}"
-                echo "=== Static CUDA Backtrace (auto-interrupt after ''${DELAY}s) ==="
-                echo ""
-
-                # Self-interrupt technique: fork a process that sends SIGINT after delay
-                SELF=$$
-                ( sleep "$DELAY" ; kill -INT $SELF ) &
-                KILLER=$!
-
-                # GDB will receive the SIGINT, stop the inferior, and print backtrace
-                ${pkgs.gdb}/bin/gdb \
-                  -ex "set pagination off" \
-                  -ex "run" \
-                  -ex "bt" \
-                  -ex "thread apply all bt" \
-                  -ex "quit" \
-                  "${ctx.ortWrapperDefault}/bin/ort-wrapper"
-
-                kill $KILLER 2>/dev/null || true
-              '';
-            in
-            {
-              type = "app";
-              program = "${wrapper}/bin/debug-ort-bt";
-            };
         }
       );
 

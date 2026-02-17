@@ -4,8 +4,8 @@
 //! if you set RUST_LOG=warn before running benchmarks.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use onnxruntime_test_harness::{
-    create_session, get_test_model_path, init_ort, PreparedInput, ProviderInfo, ProviderPreference,
+use ort_wrapper::{
+    create_session, get_test_model_path, init, PreparedInput, ProviderInfo, ProviderPreference,
 };
 use ort::session::Session;
 use tracing::warn;
@@ -20,7 +20,7 @@ fn run_inference(session: &mut Session, prepared: &PreparedInput) {
 }
 
 fn cpu_inference_benchmark(c: &mut Criterion) {
-    init_ort();
+    init();
 
     let model_path = match get_test_model_path() {
         Ok(path) => path,
@@ -51,7 +51,7 @@ fn cpu_inference_benchmark(c: &mut Criterion) {
 }
 
 fn gpu_inference_benchmark(c: &mut Criterion) {
-    init_ort();
+    init();
 
     let info = ProviderInfo::detect();
     if !info.has_gpu() {
@@ -97,7 +97,7 @@ fn gpu_inference_benchmark(c: &mut Criterion) {
 }
 
 fn batch_size_benchmark(c: &mut Criterion) {
-    init_ort();
+    init();
 
     let model_path = match get_test_model_path() {
         Ok(path) => path,

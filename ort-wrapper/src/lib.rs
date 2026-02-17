@@ -1,88 +1,92 @@
-//! ORT Wrapper - ONNX Runtime Rust bindings with static linking
+//! ORT Wrapper — self-contained ONNX Runtime bindings
 //!
-//! Provides utilities for running ONNX models with various execution providers.
+//! Re-exports [`ort`] and handles the FFI initialization required by the
+//! `alternative-backend` linking strategy.  Downstream crates depend on
+//! `ort-wrapper` alone; [`SessionBuilder`] and [`infer`] auto-initialize.
 //!
 //! # Feature Flags
 //!
-//! Accelerators are selected at compile time via Cargo features:
-//! - `cuda` - Enable CUDA execution provider (Linux only)
-//! - `coreml` - Enable CoreML execution provider (macOS only)
-//! - (no features) - CPU-only execution
+//! Accelerators are selected at compile time:
+//! - `cuda` — CUDA execution provider (Linux)
+//! - `coreml` — CoreML execution provider (macOS)
+//! - `cuda-dyn` — dynamic CUDA via `libonnxruntime.so`
+//! - *(none)* — CPU-only
 //!
-//! # Static Linking
+//! # Quick Start
 //!
-//! This crate uses the `alternative-backend` feature of `ort`, which means we must
-//! initialize the ONNX Runtime API manually via `init_ort()` before using any ort APIs.
+//! ```ignore
+//! // Full control via builder
+//! let session = ort_wrapper::SessionBuilder::from_file("model.onnx")
+//!     .with_provider(ort_wrapper::ProviderPreference::PreferGpu)
+//!     .build()?;
+//!
+//! // One-shot inference (builds session, runs, returns outputs)
+//! let outputs = ort_wrapper::infer("model.onnx", &input_array)?;
+//! ```
+
+pub use ndarray;
+pub use ort;
 
 use anyhow::{Context, Result};
 use ort::{
     execution_providers::ExecutionProviderDispatch,
     session::{Session, SessionInputValue},
 };
-use std::path::Path;
-use std::sync::Once;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tracing::{debug, info, instrument, trace, warn};
 
-// Import ExecutionProvider trait to access is_available() method
 #[cfg(feature = "cuda")]
 use ort::execution_providers::CUDAExecutionProvider;
 #[cfg(feature = "coreml")]
 use ort::execution_providers::CoreMLExecutionProvider;
-
-// The ExecutionProvider trait is needed to call is_available()
 #[cfg(any(feature = "cuda", feature = "coreml"))]
 use ort::execution_providers::ExecutionProvider;
 
-// =============================================================================
-// Static ONNX Runtime API Initialization
-// =============================================================================
-
-// Declare the OrtGetApiBase function from the statically linked ONNX Runtime
 extern "C" {
     fn OrtGetApiBase() -> *const ort::sys::OrtApiBase;
 }
 
-static ORT_INIT: Once = Once::new();
+static ORT_INIT: OnceLock<()> = OnceLock::new();
 
-/// Initialize the ONNX Runtime API for static linking.
+/// Initialize the ONNX Runtime API.
 ///
-/// This must be called before using any `ort` APIs. It's safe to call multiple
-/// times - subsequent calls are no-ops.
+/// Must be called before any [`ort`] API usage. Idempotent — subsequent calls
+/// are no-ops. If initialization panics (null API pointer, version mismatch),
+/// the `OnceLock` remains unset and a future call will retry.
+///
+/// High-level helpers ([`SessionBuilder::build`], [`infer`], [`create_session`])
+/// call this automatically.
 ///
 /// # Panics
 ///
-/// Panics if the ONNX Runtime API cannot be initialized (e.g., version mismatch).
+/// Panics if ORT cannot provide a compatible API (unrecoverable).
 #[instrument(level = "info")]
-pub fn init_ort() {
-    ORT_INIT.call_once(|| {
-        info!("Initializing ONNX Runtime API (first call)");
+pub fn init() {
+    ORT_INIT.get_or_init(|| {
+        info!("Initializing ONNX Runtime API");
         unsafe {
-            trace!("Calling OrtGetApiBase()");
             let api_base = OrtGetApiBase();
-            if api_base.is_null() {
-                panic!("OrtGetApiBase returned null");
-            }
-            trace!("OrtGetApiBase returned non-null pointer");
+            assert!(!api_base.is_null(), "OrtGetApiBase returned null");
 
-            trace!("Calling GetApi with version {}", ort::sys::ORT_API_VERSION);
-            let get_api = (*api_base).GetApi;
-            let api_ptr = get_api(ort::sys::ORT_API_VERSION);
-            if api_ptr.is_null() {
-                panic!(
-                    "OrtApiBase::GetApi({}) returned null - version mismatch?",
-                    ort::sys::ORT_API_VERSION
-                );
-            }
-            trace!("GetApi returned non-null pointer");
+            let api_ptr = ((*api_base).GetApi)(ort::sys::ORT_API_VERSION);
+            assert!(
+                !api_ptr.is_null(),
+                "OrtApiBase::GetApi({}) returned null — version mismatch?",
+                ort::sys::ORT_API_VERSION
+            );
 
-            let api = *api_ptr;
-            trace!("Setting API in ort crate");
-            if !ort::set_api(api) {
+            if !ort::set_api(*api_ptr) {
                 debug!("API was already set (race condition, harmless)");
             }
             info!("ONNX Runtime API initialized successfully");
         }
     });
+}
+
+/// Returns `true` if [`init`] has completed successfully.
+pub fn is_initialized() -> bool {
+    ORT_INIT.get().is_some()
 }
 
 /// Information about available execution providers
@@ -94,18 +98,15 @@ pub struct ProviderInfo {
 }
 
 impl ProviderInfo {
-    /// Check which execution providers are available
+    /// Check which execution providers are available.
     ///
-    /// Uses compile-time feature detection:
-    /// - `cuda` feature: checks CUDA availability
-    /// - `coreml` feature: checks CoreML availability
+    /// Calls [`init`] automatically.
     #[instrument(level = "debug")]
     pub fn detect() -> Self {
+        init();
         debug!("Detecting available execution providers");
-        let cpu_available = true; // CPU is always available
-        trace!("CPU provider: available (always)");
+        let cpu_available = true;
 
-        // CUDA availability (when cuda feature is enabled)
         #[cfg(feature = "cuda")]
         let cuda_available = {
             trace!("Checking CUDA availability (feature enabled)");
@@ -121,7 +122,6 @@ impl ProviderInfo {
             false
         };
 
-        // CoreML availability (when coreml feature is enabled)
         #[cfg(feature = "coreml")]
         let coreml_available = {
             trace!("Checking CoreML availability (feature enabled)");
@@ -194,57 +194,161 @@ pub enum ProviderPreference {
     RequireGpu,
 }
 
-/// Create an ONNX inference session with the specified provider preference
-#[instrument(level = "info", skip(model_path), fields(model = ?model_path))]
-pub fn create_session(model_path: &Path, preference: ProviderPreference) -> Result<Session> {
-    info!(?preference, "Creating inference session");
+/// How to load the model — file path or in-memory bytes
+enum ModelSource {
+    File(PathBuf),
+    Memory(Vec<u8>),
+}
 
-    let info = ProviderInfo::detect();
+/// Configurable session builder.
+///
+/// Subsumes [`create_session`] with a fluent API that also supports
+/// loading models from memory.
+///
+/// ```ignore
+/// let session = ort_wrapper::SessionBuilder::from_file("model.onnx")
+///     .with_provider(ort_wrapper::ProviderPreference::PreferGpu)
+///     .build()?;
+/// ```
+pub struct SessionBuilder {
+    source: ModelSource,
+    preference: ProviderPreference,
+}
 
-    // Build list of execution providers based on preference
-    debug!("Building execution provider list");
-    let providers: Vec<ExecutionProviderDispatch> = match preference {
-        ProviderPreference::CpuOnly => {
-            debug!("Using CPU-only mode");
-            vec![] // Empty = CPU only
+impl SessionBuilder {
+    /// Load a model from a file path.
+    pub fn from_file(path: impl AsRef<Path>) -> Self {
+        Self {
+            source: ModelSource::File(path.as_ref().to_path_buf()),
+            preference: ProviderPreference::default(),
         }
-        ProviderPreference::PreferGpu => {
-            debug!("Preferring GPU with CPU fallback");
-            build_gpu_providers(&info)
-        }
-        ProviderPreference::RequireGpu => {
-            if !info.has_gpu() {
-                warn!("GPU required but not available");
-                anyhow::bail!(
-                    "{} execution provider required but not available",
-                    ProviderInfo::accelerator_name()
-                );
-            }
-            debug!("GPU required and available");
-            build_gpu_providers(&info)
-        }
-    };
-
-    debug!(provider_count = providers.len(), "Building session");
-    let mut builder = Session::builder()?;
-
-    for (i, ep) in providers.iter().enumerate() {
-        trace!(index = i, "Adding execution provider");
-        builder = builder.with_execution_providers([ep.clone()])?;
     }
 
-    info!("Loading model from file");
-    let session = builder
-        .commit_from_file(model_path)
-        .with_context(|| format!("Failed to load model from {:?}", model_path))?;
+    /// Load a model from in-memory bytes.
+    pub fn from_memory(data: impl Into<Vec<u8>>) -> Self {
+        Self {
+            source: ModelSource::Memory(data.into()),
+            preference: ProviderPreference::default(),
+        }
+    }
 
-    info!(
-        input_count = session.inputs().len(),
-        output_count = session.outputs().len(),
-        "Session created successfully"
-    );
+    /// Set the execution provider preference (default: [`ProviderPreference::PreferGpu`]).
+    pub fn with_provider(mut self, preference: ProviderPreference) -> Self {
+        self.preference = preference;
+        self
+    }
 
-    Ok(session)
+    /// Build the session. Calls [`init`] automatically.
+    #[instrument(level = "info", skip_all, fields(preference = ?self.preference))]
+    pub fn build(self) -> Result<Session> {
+        init();
+
+        let info = ProviderInfo::detect();
+
+        debug!("Building execution provider list");
+        let providers: Vec<ExecutionProviderDispatch> = match self.preference {
+            ProviderPreference::CpuOnly => {
+                debug!("Using CPU-only mode");
+                vec![]
+            }
+            ProviderPreference::PreferGpu => {
+                debug!("Preferring GPU with CPU fallback");
+                build_gpu_providers(&info)
+            }
+            ProviderPreference::RequireGpu => {
+                if !info.has_gpu() {
+                    warn!("GPU required but not available");
+                    anyhow::bail!(
+                        "{} execution provider required but not available",
+                        ProviderInfo::accelerator_name()
+                    );
+                }
+                debug!("GPU required and available");
+                build_gpu_providers(&info)
+            }
+        };
+
+        debug!(provider_count = providers.len(), "Building session");
+        let mut builder = Session::builder()?;
+
+        for (i, ep) in providers.iter().enumerate() {
+            trace!(index = i, "Adding execution provider");
+            builder = builder.with_execution_providers([ep.clone()])?;
+        }
+
+        let session = match self.source {
+            ModelSource::File(ref path) => {
+                info!("Loading model from file");
+                builder
+                    .commit_from_file(path)
+                    .with_context(|| format!("Failed to load model from {:?}", path))?
+            }
+            ModelSource::Memory(ref data) => {
+                info!(bytes = data.len(), "Loading model from memory");
+                builder
+                    .commit_from_memory(data)
+                    .context("Failed to load model from memory")?
+            }
+        };
+
+        info!(
+            input_count = session.inputs().len(),
+            output_count = session.outputs().len(),
+            "Session created successfully"
+        );
+
+        Ok(session)
+    }
+}
+
+/// Create an ONNX inference session with the specified provider preference.
+///
+/// Convenience wrapper around [`SessionBuilder`]. Calls [`init`] automatically.
+pub fn create_session(model_path: &Path, preference: ProviderPreference) -> Result<Session> {
+    SessionBuilder::from_file(model_path)
+        .with_provider(preference)
+        .build()
+}
+
+/// One-shot inference: load model, run a single input, return all outputs.
+///
+/// Accepts any `ndarray::ArrayBase` with `f32` elements — owned arrays, views,
+/// any dimensionality. Builds a session internally (prefer [`SessionBuilder`]
+/// when running multiple inferences on the same model).
+///
+/// Returns one `ArrayD<f32>` per model output. Errors if any output is not
+/// f32-extractable.
+#[instrument(level = "info", skip_all, fields(model = %model_path.as_ref().display()))]
+pub fn infer<S, D>(
+    model_path: impl AsRef<Path>,
+    input: &ndarray::ArrayBase<S, D>,
+) -> Result<Vec<ndarray::ArrayD<f32>>>
+where
+    S: ndarray::Data<Elem = f32>,
+    D: ndarray::Dimension,
+{
+    let mut session = SessionBuilder::from_file(model_path).build()?;
+
+    let shape: Vec<usize> = input.shape().to_vec();
+    let data: Vec<f32> = input.iter().copied().collect();
+    let tensor = ort::value::Tensor::from_array((shape, data.into_boxed_slice()))?;
+    let input_value = SessionInputValue::from(&tensor);
+
+    info!("Running one-shot inference");
+    let outputs = session.run(std::slice::from_ref(&input_value))?;
+
+    outputs
+        .iter()
+        .map(|(name, value)| {
+            let view = value
+                .try_extract_array::<f32>()
+                .with_context(|| format!("Output '{}' is not f32-extractable", name))?;
+            let out_shape = view.shape().to_vec();
+            let out_data: Vec<f32> = view.iter().copied().collect();
+            Ok(ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&out_shape), out_data)
+                .context("shape/data size mismatch after extraction")?)
+        })
+        .collect()
 }
 
 /// Build GPU execution providers based on compiled features and availability
@@ -252,19 +356,16 @@ fn build_gpu_providers(info: &ProviderInfo) -> Vec<ExecutionProviderDispatch> {
     #[allow(unused_mut)] // eps is only mutated when accelerator features are enabled
     let mut eps = Vec::new();
 
-    // CUDA (when cuda feature is enabled)
     #[cfg(feature = "cuda")]
     if info.cuda_available {
         eps.push(CUDAExecutionProvider::default().build().into());
     }
 
-    // CoreML (when coreml feature is enabled)
     #[cfg(feature = "coreml")]
     if info.coreml_available {
         eps.push(CoreMLExecutionProvider::default().build().into());
     }
 
-    // Suppress unused variable warning when no accelerator features are enabled
     let _ = info;
 
     eps
@@ -291,14 +392,12 @@ impl InferenceOutput {
         for (i, (data, name)) in self.data.iter().zip(&self.names).enumerate() {
             trace!(output_index = i, name = %name, len = data.len(), "Validating tensor");
 
-            // Check for empty tensors
             if data.is_empty() {
                 warn!(name = %name, "Empty tensor");
                 report.warnings.push(format!("Output '{}' is empty", name));
                 continue;
             }
 
-            // Check for non-finite values
             let non_finite_count = data.iter().filter(|v| !v.is_finite()).count();
             if non_finite_count > 0 {
                 warn!(
@@ -315,7 +414,6 @@ impl InferenceOutput {
                 ));
             }
 
-            // Compute statistics
             let finite_values: Vec<f32> = data.iter().copied().filter(|v| v.is_finite()).collect();
             if finite_values.is_empty() {
                 report.errors.push(format!("Output '{}' has no finite values", name));
@@ -327,7 +425,6 @@ impl InferenceOutput {
             let sum: f32 = finite_values.iter().sum();
             let mean = sum / finite_values.len() as f32;
 
-            // Variance calculation
             let variance: f32 = finite_values
                 .iter()
                 .map(|v| (v - mean).powi(2))
@@ -355,7 +452,6 @@ impl InferenceOutput {
                 "Tensor statistics"
             );
 
-            // Warn on suspicious patterns
             if stats.std_dev < 1e-10 {
                 warn!(name = %name, "Tensor has near-zero variance (all same value?)");
                 report.warnings.push(format!(
@@ -392,7 +488,6 @@ impl InferenceOutput {
             .map(|logits| {
                 let probabilities = softmax(logits);
 
-                // Get top-k indices
                 let mut indexed: Vec<(usize, f32)> =
                     probabilities.into_iter().enumerate().collect();
                 indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -439,11 +534,7 @@ impl InferenceOutput {
     }
 }
 
-// =============================================================================
-// Helper Functions
-// =============================================================================
-
-/// Compute softmax probabilities from logits (numerically stable)
+/// Numerically stable softmax
 fn softmax(logits: &[f32]) -> Vec<f32> {
     let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let exp_values: Vec<f32> = logits.iter().map(|v| (v - max_logit).exp()).collect();
@@ -474,7 +565,6 @@ impl PreparedInput {
             .tensor_shape()
             .expect("Input should be a tensor");
 
-        // Replace dynamic dims (-1) with 1
         let shape: Vec<usize> = shape_ref
             .iter()
             .map(|&d| if d < 0 { 1 } else { d as usize })
@@ -572,7 +662,6 @@ impl std::fmt::Display for ValidationReport {
 pub fn run_random_inference(session: &mut Session) -> Result<InferenceOutput> {
     info!("Preparing inference inputs");
 
-    // Prepare all inputs using the PreparedInput helper
     let input_tensors: Vec<ort::value::Tensor<f32>> = (0..session.inputs().len())
         .map(|idx| {
             let name = session.inputs()[idx].name();
@@ -591,7 +680,7 @@ pub fn run_random_inference(session: &mut Session) -> Result<InferenceOutput> {
         })
         .collect();
 
-    // Convert tensors to SessionInputValue - ort v2 requires SessionInputValue for run()
+    // ort v2 requires SessionInputValue wrapper for run()
     let input_values: Vec<SessionInputValue<'_>> = input_tensors
         .iter()
         .map(SessionInputValue::from)
@@ -600,13 +689,11 @@ pub fn run_random_inference(session: &mut Session) -> Result<InferenceOutput> {
     info!(input_count = input_values.len(), "Running inference");
     let start = std::time::Instant::now();
 
-    // Session::run accepts &[SessionInputValue] via Into<SessionInputs>
     let outputs = session.run(input_values.as_slice())?;
 
     let elapsed = start.elapsed();
     info!(elapsed_ms = elapsed.as_millis(), "Inference complete");
 
-    // Extract output data
     debug!("Extracting output tensors");
     let mut shapes = Vec::new();
     let mut data = Vec::new();
@@ -640,31 +727,19 @@ pub fn run_random_inference(session: &mut Session) -> Result<InferenceOutput> {
     Ok(InferenceOutput { shapes, data, names })
 }
 
-/// Legacy function for backward compatibility - returns just shapes
-#[instrument(level = "info", skip(session))]
-pub fn run_random_inference_shapes(session: &mut Session) -> Result<Vec<Vec<i64>>> {
-    let output = run_random_inference(session)?;
-    Ok(output
-        .shapes
-        .into_iter()
-        .map(|s| s.into_iter().map(|d| d as i64).collect())
-        .collect())
-}
-
 /// Get the path to a test model
 ///
 /// Looks for ONNX_TEST_MODEL environment variable first,
 /// then falls back to a default location.
-pub fn get_test_model_path() -> Result<std::path::PathBuf> {
+pub fn get_test_model_path() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("ONNX_TEST_MODEL") {
-        let path = std::path::PathBuf::from(path);
+        let path = PathBuf::from(path);
         if path.exists() {
             return Ok(path);
         }
         anyhow::bail!("ONNX_TEST_MODEL path does not exist: {:?}", path);
     }
 
-    // Check common locations
     let candidates = [
         "squeezenet1.0-7.onnx",
         "test-model.onnx",
@@ -672,7 +747,7 @@ pub fn get_test_model_path() -> Result<std::path::PathBuf> {
     ];
 
     for candidate in candidates {
-        let path = std::path::PathBuf::from(candidate);
+        let path = PathBuf::from(candidate);
         if path.exists() {
             return Ok(path);
         }
@@ -690,7 +765,7 @@ mod tests {
 
     #[test_log::test]
     fn test_provider_detection() {
-        init_ort();
+        init();
         let info = ProviderInfo::detect();
         assert!(info.cpu_available, "CPU should always be available");
         info!(

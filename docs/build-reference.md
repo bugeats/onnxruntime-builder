@@ -2,22 +2,32 @@
 
 ## Build Outputs
 
-### Static Build (default)
+### Hybrid Build (active — static core + CUDA provider dlopen)
 ```
 result/lib/
-├── libonnxruntime.a              # Unified static library
+├── libonnxruntime.a                    # Static core library (linked at compile time)
+├── libonnxruntime_providers_shared.so  # Provider bridge (dlopen'd at runtime)
+├── libonnxruntime_providers_cuda.so    # CUDA provider (dlopen'd at runtime)
+└── cudnn/libcudnn*.so*                 # cuDNN shared libs
+```
+
+### Static CUDA Build (hangs — see docs/static-cuda-hang.md)
+```
+result/lib/
+├── libonnxruntime.a              # Unified static library (includes CUDA providers)
 ├── libonnxruntime_providers_cuda.a    # CUDA provider (static)
 └── cudnn/libcudnn*.so*           # cuDNN shared libs (for bundling)
 ```
 
-### Shared Build (cuda-dyn)
+### Shared Build (removed — superseded by hybrid)
 ```
 result/lib/
-├── libonnxruntime.so             # Main shared library
-├── libonnxruntime_providers_cuda.so   # CUDA provider (dlopened at runtime)
+├── libonnxruntime.so             # Shared library
+├── libonnxruntime_providers_cuda.so   # CUDA provider (dlopen'd at runtime)
 ├── libonnxruntime_providers_shared.so # Provider bridge
 └── cudnn/libcudnn*.so*           # cuDNN shared libs
 ```
+Available via `mkOnnxruntime { buildShared = true; }` but no longer exposed as a package.
 
 ## Build Times
 
@@ -26,39 +36,38 @@ Approximate build times on a modern workstation (first build, no cache):
 | Build | Time | Notes |
 |-------|------|-------|
 | `onnxruntime-cpu` | ~5-10 min | CPU-only, fastest iteration |
-| `onnxruntime-cuda-dyn` | ~20-40 min | Dynamic CUDA libs, scales with `cudaArchitectures` |
+| `onnxruntime-cuda-hybrid` | ~20-40 min | Hybrid CUDA, scales with `cudaArchitectures` |
 | `onnxruntime` (static CUDA) | ~30-60 min | Full static build with archive merging |
 | `ort-wrapper-*` | ~1-2 min | Rust wrapper (after ONNX Runtime is cached) |
 
 **Factors affecting build time:**
-- **CUDA architectures**: Each sm_XX target adds compilation time. `"90;100"` is ~2x slower than `"90"` alone.
+- **CUDA architectures**: Each sm_XX target adds compilation time. `"90;120"` is ~2x slower than `"90"` alone.
 - **Nix cache**: Subsequent builds reuse cached artifacts. Only changed components rebuild.
 - **NVCC threads**: Set to 1 (`onnxruntime_NVCC_THREADS`) to avoid OOM on systems with limited RAM.
 
 ## Build Variants
 
-The flake supports two CUDA build strategies via `mkOnnxruntime`:
+The flake supports two CUDA strategies via `mkOnnxruntime`:
 
-1. **Static (`buildShared=false`)**: Produces `.a` files, requires complex linking, patches for static CUDA provider. Currently hangs at runtime.
+1. **Hybrid (`hybridCuda=true`)**: `libonnxruntime.a` (static core) + CUDA providers as separate `.so` files loaded at runtime via dlopen. **This is the active architecture.** Uses upstream cmake's default behavior — CUDA provider and provider bridge are unconditionally shared modules on Linux.
 
-2. **Shared (`buildShared=true`)**: Produces `.so` files, standard dynamic linking. Used by `cuda-dyn`. Works correctly.
+2. **Static CUDA (default, static CUDA patches applied)**: `libonnxruntime.a` with CUDA providers compiled in. Hangs at runtime due to SIOF. Our patches (`cuda-static-provider.patch`, `providers-shared-static.patch`) force providers into static archives, overriding upstream defaults.
 
 ## Cargo Features
 
-| Feature | Linking | Library |
-|---------|---------|---------|
-| `cuda` | Static | `libonnxruntime.a` + complex deps |
-| `cuda-dyn` | Dynamic | `libonnxruntime.so` |
-| `coreml` | Static | `libonnxruntime.a` + frameworks |
+| Feature | Architecture | Status |
+|---------|-------------|--------|
+| `cuda` | Static ort, static CUDA | Hangs at runtime (SIOF) |
+| `cuda-dlopen` | Static ort, CUDA via dlopen | Works (hybrid: static core + provider `.so` files) |
+| `coreml` | Static ort, CoreML | Works (macOS) |
 
-The `cuda-dyn` feature enables `cuda` (for runtime detection) but uses a different `build.rs` path that links against the shared library.
+The `cuda-dlopen` feature enables `cuda` (for runtime provider detection) and uses the hybrid `build.rs` path — static `libonnxruntime.a` linked at compile time, CUDA providers loaded at runtime from `.so` files via ORT's `GetRuntimePath()`.
 
 ## Environment Variables
 
-| Variable | Feature | Purpose |
+| Variable | Used By | Purpose |
 |----------|---------|---------|
-| `ORT_LIB_LOCATION` | cuda, coreml | Path to static `.a` files (ort crate convention) |
-| `ORT_DYLIB_PATH` | cuda-dyn | Path to shared `.so` files |
+| `ORT_LIB_LOCATION` | all | Path to directory containing `libonnxruntime.a` (ort crate convention) |
 | `ONNX_TEST_MODEL` | all | Path to test ONNX model |
 | `LD_LIBRARY_PATH` | cuda* | Must include cuDNN path at runtime |
 
@@ -66,23 +75,21 @@ The `cuda-dyn` feature enables `cuda` (for runtime detection) but uses a differe
 
 All patches live in `patches/`. Grouped by purpose:
 
-**SIOF fixes** (Static Initialization Order Fiasco) — see `docs/siof-patches.md` for details:
+**Portability** (applied to all builds):
+- `musl-execinfo.patch` — Stub `execinfo.h` for musl libc
+- `musl-cstdint.patch` — Add missing `<cstdint>` include
+
+**Static-only CUDA** (applied only when `useCuda && !buildShared && !hybridCuda`):
+- `cuda-static-provider.patch` — Force CUDA provider from shared module to static archive
+- `providers-shared-static.patch` — Force provider bridge from shared lib to static archive
 - `static-init-bridge.patch` — Meyers singleton for `ProviderHostImpl`
 - `static-init-cpu.patch` — Meyers singleton for `ProviderHostCPUImpl`
 - `static-init-provider.patch` — Lazy init for `g_host`/`g_host_cpu`
 - `static-init-common.patch` — Fallback to static host when `g_host` is NULL
-
-**Provider bridge loop fixes** (static CUDA hang):
 - `static-datatype-loop.patch` — `ORT_STATIC_PROVIDERS` guard for `GetType<T>`
 - `static-tensorshape-loop.patch` — `ORT_STATIC_PROVIDERS` guard for `TensorShape`
 
-**Build system**:
-- `cuda-static-provider.patch` — Enable static CUDA provider compilation
-- `providers-shared-static.patch` — Build `providers_shared` as static lib
-
-**Portability**:
-- `musl-execinfo.patch` — Stub `execinfo.h` for musl libc
-- `musl-cstdint.patch` — Add missing `<cstdint>` include
+See [siof-patches.md](siof-patches.md) and [static-cuda-hang.md](static-cuda-hang.md) for details on the static-only patches.
 
 ## GPU Architecture
 

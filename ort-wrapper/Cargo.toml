@@ -9,15 +9,14 @@ build = "build.rs"
 # These enable the corresponding ort feature AND the Rust code paths
 cuda = ["ort/cuda"]
 coreml = ["ort/coreml"]
-# Dynamic CUDA linking - uses shared libonnxruntime.so instead of static archives
-# Enables `cuda` feature for runtime detection while using different linking strategy
-cuda-dyn = ["cuda"]
+# Hybrid mode — static onnxruntime core, CUDA providers load at runtime via dlopen.
+cuda-dlopen = ["cuda"]
 
 [build-dependencies]
 # No build dependencies - we handle all linking ourselves
 
 [dependencies]
-ndarray = "0.16"
+ndarray = "0.17"
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

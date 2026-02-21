@@ -114,4 +114,4 @@ onnxruntime::ProviderHost* Provider_GetHost() {
 
 ## Status
 
-These patches are verified working for CPU-only builds. The CUDA build has a separate hang issue unrelated to these SIOF fixes (see main CLAUDE.md).
+These patches are verified working for CPU-only builds. The CUDA build has a separate hang issue unrelated to these SIOF fixes (see [static-cuda-hang.md](static-cuda-hang.md)).

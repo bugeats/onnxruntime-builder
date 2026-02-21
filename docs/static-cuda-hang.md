@@ -1,6 +1,6 @@
 # Static CUDA Hang
 
-The static CUDA build (`nix build .#` / `nix run .#ort-wrapper-cuda`) hangs during static initialization.
+The static CUDA build hangs during static initialization. The static CUDA `onnxruntime` package builds, but any binary linking it statically with CUDA providers hangs at startup.
 
 ## Root Cause
 
@@ -14,21 +14,11 @@ Two patterns patched so far:
 1. `GetType<T>()` → `Provider_GetHost()->DataTypeImpl__GetType_T()` → back to `GetType<T>()`
 2. `TensorShape::Allocate()` → `g_host->TensorShape__Allocate()` → back to `TensorShape::Allocate()`
 
-## Debug Tools
-
-```bash
-nix run .#debug-bt                # Auto-interrupt GDB backtrace (default 2s)
-nix run .#debug-bt -- 5           # Custom delay
-nix run .#debug-gdb               # Interactive GDB session
-nix run .#build-cuda              # Build with visible logs
-```
-
 ## Status
 
-Two infinite loop patterns patched, rebuild needed to test. If still hangs, capture backtrace with `nix run .#debug-bt -- 3`.
+Two infinite loop patterns patched (`GetType<T>`, `TensorShape::Allocate`). The static CUDA build compiles but hangs at runtime. The hybrid build (`hybridCuda=true`) avoids this entirely and is the active architecture.
 
-## Fallback Approaches
+## Alternative Approaches
 
-If patching becomes untenable:
-1. Disable provider bridge entirely (investigate `onnxruntime_USE_FULL_PROTOBUF` or similar flags)
-2. Hybrid linking — keep provider bridge as shared lib, link everything else static
+1. **Hybrid linking (validated, active path)** — static `libonnxruntime.a` (CPU core) + CUDA providers as separate `.so` files loaded via dlopen. Avoids SIOF entirely by keeping CUDA out of the static archive. This is upstream cmake's default behavior — `cuda-static-provider.patch` and `providers-shared-static.patch` are what override it. See CLAUDE.md implementation plan.
+2. **Disable provider bridge** — investigate `onnxruntime_USE_FULL_PROTOBUF` or similar cmake flags to eliminate the bridge code that causes infinite loops.

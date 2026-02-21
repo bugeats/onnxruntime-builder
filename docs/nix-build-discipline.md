@@ -9,9 +9,9 @@ pgrep -f "onnxruntime\|nvcc" && echo "⚠️  BUILD RUNNING" || echo "✓ Clear"
 
 ## Running Builds
 
-- Use `nix run .#build-cuda` for visible progress on long builds
+- Use `nix build .#onnxruntime-cuda-hybrid --print-build-logs 2>&1` for visible progress on CUDA builds
 - Use `nix run` (CPU-only default) for fast iteration (~1-2 min)
-- Use `cuda-dyn` to validate CUDA integration while static build is in progress
+- Use `nix run .#ort-wrapper-cuda-dlopen` to validate CUDA integration
 
 **Why this matters**: CUDA builds take 30-60 minutes and saturate CPU. The Nix daemon runs builds independently — `nix build` can return while compilation continues. Starting a second build creates resource contention and confusion.
 
@@ -32,7 +32,7 @@ nix build .#foo --print-build-logs 2>&1
 
 ```bash
 # Reliable status check
-nix path-info .#ort-wrapper-cuda 2>/dev/null && echo "DONE" || echo "NOT DONE"
+nix path-info .#ort-wrapper-cuda-dlopen 2>/dev/null && echo "DONE" || echo "NOT DONE"
 
 # Check if actively compiling
 pgrep -f "onnxruntime" && echo "Build running" || echo "Not running"

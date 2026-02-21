@@ -152,6 +152,7 @@
           enableCuda ? null,
           enableCoreml ? null,
           buildShared ? false, # Build shared library instead of static
+          hybridCuda ? false, # Static core + CUDA providers as shared libs (upstream default)
         }:
         let
           inherit (pkgs)
@@ -194,11 +195,6 @@
 
         in
         effectiveStdenv.mkDerivation (finalAttrs: {
-          # Package naming:
-          # - onnxruntime-cpu: static CPU-only
-          # - onnxruntime-cuda: static CUDA (default on Linux)
-          # - onnxruntime-cuda-dyn: shared/dynamic CUDA
-          # - onnxruntime-coreml: static CoreML (default on macOS)
           pname =
             "onnxruntime"
             + (
@@ -209,7 +205,14 @@
               else
                 "-cpu"
             )
-            + (if buildShared then "-dyn" else "");
+            + (
+              if buildShared then
+                "-dlopen"
+              else if hybridCuda then
+                "-hybrid"
+              else
+                ""
+            );
           version = onnxruntimeVersion;
 
           src = fetchFromGitHub {
@@ -239,8 +242,8 @@
             ./patches/musl-execinfo.patch
             ./patches/musl-cstdint.patch
           ]
-          # Static CUDA patches - only apply when building static library
-          ++ lib.optionals (useCuda && !buildShared) [
+          # Static CUDA patches - only for fully-static CUDA (not hybrid)
+          ++ lib.optionals (useCuda && !buildShared && !hybridCuda) [
             ./patches/cuda-static-provider.patch
             ./patches/providers-shared-static.patch
             ./patches/static-init-common.patch
@@ -337,7 +340,7 @@
             (lib.cmakeFeature "onnxruntime_NVCC_THREADS" "1") # Avoid OOM
           ]
           # Static CUDA: define ORT_STATIC_PROVIDERS to skip conflicting template specializations
-          ++ lib.optionals (useCuda && !buildShared) [
+          ++ lib.optionals (useCuda && !buildShared && !hybridCuda) [
             "-DCMAKE_CXX_FLAGS=-DORT_STATIC_PROVIDERS=1"
           ]
           ++ lib.optionals useCoreml [
@@ -389,8 +392,21 @@
             mkdir -p $out/lib/cudnn
             cp -L ${cudaPackages.cudnn.lib}/lib/libcudnn*.so* $out/lib/cudnn/ || true
           ''
+          # Hybrid: copy provider shared libraries for runtime dlopen
+          + lib.optionalString (useCuda && hybridCuda) ''
+            for f in libonnxruntime_providers_cuda.so libonnxruntime_providers_shared.so; do
+              if [ ! -f "$out/lib/$f" ]; then
+                found=$(find . -name "$f" -not -path "$out/*" -print -quit 2>/dev/null)
+                if [ -n "$found" ]; then
+                  cp "$found" "$out/lib/"
+                else
+                  echo "WARNING: $f not found in build directory"
+                fi
+              fi
+            done
+          ''
           # CUDA device linking: separable compilation (-dc) requires nvcc -dlink
-          + lib.optionalString (useCuda && !buildShared) ''
+          + lib.optionalString (useCuda && !buildShared && !hybridCuda) ''
             DLINK_DIR=$(mktemp -d)
             pushd $DLINK_DIR
             ${pkgs.binutils}/bin/ar x $out/lib/libonnxruntime_providers_cuda.a
@@ -448,12 +464,18 @@
               useCuda
               useCoreml
               buildShared
+              hybridCuda
               ;
           };
 
           meta = {
             description = "ONNX Runtime library (${acceleratorName}, ${
-              if buildShared then "dynamic" else "static"
+              if buildShared then
+                "dlopen"
+              else if hybridCuda then
+                "hybrid"
+              else
+                "static"
             } linking)";
             homepage = "https://github.com/microsoft/onnxruntime";
             license = lib.licenses.mit;
@@ -474,9 +496,9 @@
           pkgs,
           system,
           onnxruntime,
-          useCuda,
-          useCoreml,
-          squeezenet-model,
+          useCuda ? onnxruntime.useCuda,
+          useCoreml ? onnxruntime.useCoreml,
+          squeezenet-model ? null,
         }:
         let
           inherit (pkgs) lib;
@@ -503,6 +525,8 @@
 
           envVars = {
             ORT_LIB_LOCATION = "${onnxruntime}/lib";
+          }
+          // lib.optionalAttrs (squeezenet-model != null) {
             ONNX_TEST_MODEL = squeezenet-model;
           };
 
@@ -515,8 +539,11 @@
             export LD_LIBRARY_PATH="${cudnnLibPath}:$LD_LIBRARY_PATH"
           '';
 
+          # cuda-dlopen for hybrid builds (static core + runtime CUDA), cuda for fully-static
           cargoFeatures = lib.concatStringsSep "," (
-            lib.optional useCuda "cuda" ++ lib.optional useCoreml "coreml"
+            lib.optional (useCuda && (onnxruntime.hybridCuda or false)) "cuda-dlopen"
+            ++ lib.optional (useCuda && !(onnxruntime.hybridCuda or false)) "cuda"
+            ++ lib.optional useCoreml "coreml"
           );
 
           inherit
@@ -608,10 +635,10 @@
             enableCuda = false;
             enableCoreml = false;
           };
-          # Shared library builds (for dynamic linking)
-          onnxruntimeCudaDyn = mkOnnxruntime {
+          # Hybrid: static core + CUDA providers as shared libs (upstream default)
+          onnxruntimeCudaHybrid = mkOnnxruntime {
             inherit pkgs system;
-            buildShared = true;
+            hybridCuda = true;
           };
 
           ortWrapperDefault = mkOrtWrapper { inherit pkgs system squeezenet-model; };
@@ -621,28 +648,34 @@
             enableCoreml = false;
           };
 
-          # Dynamic CUDA wrapper (uses shared libonnxruntime.so)
-          ortWrapperCudaDyn =
+          # CUDA dlopen wrapper (hybrid: static core + CUDA providers via dlopen)
+          ortWrapperCudaDlopen =
             if isLinux then
+              let
+                env = mkOrtWrapperEnv {
+                  inherit pkgs system squeezenet-model;
+                  onnxruntime = onnxruntimeCudaHybrid;
+                };
+              in
               pkgs.rustPlatform.buildRustPackage {
-                pname = "ort-wrapper-cuda-dyn";
+                pname = "ort-wrapper-cuda-dlopen";
                 version = "0.1.0";
                 src = ./ort-wrapper;
                 cargoLock.lockFile = ./ort-wrapper/Cargo.lock;
 
-                cargoBuildFlags = [
+                cargoBuildFlags = lib.optionals (env.cargoFeatures != "") [
                   "--features"
-                  "cuda-dyn"
+                  env.cargoFeatures
                 ];
 
-                ORT_DYLIB_PATH = "${onnxruntimeCudaDyn}/lib";
+                inherit (env.envVars) ORT_LIB_LOCATION;
                 ONNX_TEST_MODEL = squeezenet-model;
                 nativeBuildInputs = [ pkgs.pkg-config ];
-                inherit (envCudaDyn) buildInputs;
+                inherit (env) buildInputs preCheck;
                 doCheck = false;
 
                 meta = {
-                  description = "ONNX Runtime wrapper with dynamic CUDA linking";
+                  description = "ONNX Runtime wrapper with CUDA dlopen";
                   platforms = [ system ];
                   mainProgram = "ort-wrapper";
                 };
@@ -650,53 +683,23 @@
             else
               null;
 
-          # Env config for dynamic CUDA builds
-          envCudaDyn =
+          envCudaDlopen =
             if isLinux then
-              let
-                cudnnLibPath = mkCudnnLibPath {
-                  onnxruntime = onnxruntimeCudaDyn;
-                  inherit cudaPackages;
-                };
-              in
-              {
-                useCuda = true;
-                useCoreml = false;
-                inherit squeezenet-model cudnnLibPath;
-                onnxruntimeLibPath = "${onnxruntimeCudaDyn}/lib";
-                buildInputs = [
-                  onnxruntimeCudaDyn
-                  pkgs.protobuf
-                  pkgs.re2
-                  cudaPackages.cudnn
-                  cudaPackages.cuda_cudart
-                  cudaPackages.libcublas
-                  cudaPackages.libcurand
-                  cudaPackages.libcusparse
-                  cudaPackages.libcufft
-                ];
-                envVars = {
-                  ORT_DYLIB_PATH = "${onnxruntimeCudaDyn}/lib";
-                  ONNX_TEST_MODEL = squeezenet-model;
-                };
-                shellHook = ''
-                  export LD_LIBRARY_PATH="${onnxruntimeCudaDyn}/lib:${cudnnLibPath}:$LD_LIBRARY_PATH"
-                '';
+              mkOrtWrapperEnv {
+                inherit pkgs system squeezenet-model;
+                onnxruntime = onnxruntimeCudaHybrid;
               }
             else
               null;
-
-          envDefault = mkOrtWrapperEnv {
-            inherit pkgs system squeezenet-model;
-            inherit (defaultAccel) useCuda useCoreml;
-            onnxruntime = onnxruntimeCpu;
-          };
 
           envCpu = mkOrtWrapperEnv {
             inherit pkgs system squeezenet-model;
             inherit (cpuAccel) useCuda useCoreml;
             onnxruntime = onnxruntimeCpu;
           };
+
+          # Default dev environment is CPU-only for fast iteration
+          envDefault = envCpu;
 
           mkApp =
             { package, env }:
@@ -726,13 +729,7 @@
           mkShellHook =
             { env, accel }:
             let
-              featureHint =
-                if env.useCuda then
-                  " --features cuda"
-                else if env.useCoreml then
-                  " --features coreml"
-                else
-                  "";
+              featureHint = if env.cargoFeatures != "" then " --features ${env.cargoFeatures}" else "";
             in
             env.shellHook
             + ''
@@ -775,13 +772,13 @@
             cpuAccel
             onnxruntime
             onnxruntimeCpu
-            onnxruntimeCudaDyn
+            onnxruntimeCudaHybrid
             ortWrapperDefault
             ortWrapperCpu
-            ortWrapperCudaDyn
+            ortWrapperCudaDlopen
             envDefault
             envCpu
-            envCudaDyn
+            envCudaDlopen
             devPackages
             mkApp
             mkDevShell
@@ -801,10 +798,9 @@
         }
         // ctx.lib.optionalAttrs ctx.isLinux {
           onnxruntime-cpu = ctx.onnxruntimeCpu;
-          onnxruntime-cuda-dyn = ctx.onnxruntimeCudaDyn;
-          ort-wrapper-cuda = ctx.ortWrapperDefault;
+          onnxruntime-cuda-hybrid = ctx.onnxruntimeCudaHybrid;
           ort-wrapper-cpu = ctx.ortWrapperCpu;
-          ort-wrapper-cuda-dyn = ctx.ortWrapperCudaDyn;
+          ort-wrapper-cuda-dlopen = ctx.ortWrapperCudaDlopen;
         }
         // ctx.lib.optionalAttrs ctx.isDarwin {
           ort-wrapper-coreml = ctx.ortWrapperDefault;
@@ -820,21 +816,14 @@
           ort-wrapper =
             pkgs.runCommand "ort-wrapper-check"
               {
-                nativeBuildInputs = [ ctx.ortWrapperDefault ];
+                nativeBuildInputs = [ ctx.ortWrapperCpu ];
                 ONNX_TEST_MODEL = ctx.squeezenet-model;
               }
-              (
-                ''
-                  export HOME=$TMPDIR
-                ''
-                + ctx.lib.optionalString ctx.envDefault.useCuda ''
-                  export LD_LIBRARY_PATH="${ctx.envDefault.cudnnLibPath}:$LD_LIBRARY_PATH"
-                ''
-                + ''
-                  ort-wrapper
-                  touch $out
-                ''
-              );
+              ''
+                export HOME=$TMPDIR
+                ort-wrapper
+                touch $out
+              '';
         }
       );
 
@@ -847,7 +836,7 @@
           default = ctx.mkDevShell {
             name = "onnxruntime-dev";
             env = ctx.envDefault;
-            accel = ctx.defaultAccel;
+            accel = ctx.cpuAccel;
           };
         }
         // ctx.lib.optionalAttrs ctx.isLinux {
@@ -856,20 +845,10 @@
             env = ctx.envCpu;
             accel = ctx.cpuAccel;
           };
-          cuda-dyn = pkgs.mkShell {
-            name = "onnxruntime-dev-cuda-dyn";
-            packages = ctx.devPackages;
-            inherit (ctx.envCudaDyn) buildInputs;
-            inherit (ctx.envCudaDyn.envVars) ORT_DYLIB_PATH ONNX_TEST_MODEL;
-            shellHook = ctx.envCudaDyn.shellHook + ''
-              echo "ONNX Runtime development shell (Dynamic CUDA)"
-              echo "  ORT_DYLIB_PATH: $ORT_DYLIB_PATH"
-              echo "  ONNX_TEST_MODEL: $ONNX_TEST_MODEL"
-              echo ""
-              echo "Commands:"
-              echo "  cd ort-wrapper && cargo build --features cuda-dyn    # Build"
-              echo "  cd ort-wrapper && cargo test --features cuda-dyn     # Run tests"
-            '';
+          cuda-dlopen = ctx.mkDevShell {
+            name = "onnxruntime-dev-cuda-dlopen";
+            env = ctx.envCudaDlopen;
+            accel = ctx.defaultAccel;
           };
         }
       );
@@ -880,101 +859,18 @@
           ctx = mkSystemContext { inherit pkgs system; };
         in
         ctx.lib.optionalAttrs ctx.isLinux {
-          ort-wrapper-cuda = ctx.mkApp {
-            package = ctx.ortWrapperDefault;
-            env = ctx.envDefault;
-          };
           ort-wrapper-cpu = ctx.mkApp {
             package = ctx.ortWrapperCpu;
             env = ctx.envCpu;
           };
-          ort-wrapper-cuda-dyn =
-            let
-              wrapper = pkgs.writeShellScriptBin "ort-wrapper" ''
-                export LD_LIBRARY_PATH="${ctx.envCudaDyn.onnxruntimeLibPath}:${ctx.envCudaDyn.cudnnLibPath}:''${LD_LIBRARY_PATH:-}"
-                export ONNX_TEST_MODEL="${ctx.squeezenet-model}"
-                exec "${ctx.ortWrapperCudaDyn}/bin/ort-wrapper" "$@"
-              '';
-            in
-            {
-              type = "app";
-              program = "${wrapper}/bin/ort-wrapper";
-            };
-          # CPU for faster iteration
+          ort-wrapper-cuda-dlopen = ctx.mkApp {
+            package = ctx.ortWrapperCudaDlopen;
+            env = ctx.envCudaDlopen;
+          };
           default = ctx.mkApp {
             package = ctx.ortWrapperCpu;
             env = ctx.envCpu;
           };
-
-          # Debug: auto-interrupt GDB backtrace
-          # Usage: nix run .#debug-bt [seconds]
-          debug-bt =
-            let
-              wrapper = pkgs.writeShellScriptBin "debug-ort-bt" ''
-                DELAY=''${1:-2}
-                export LD_LIBRARY_PATH="${ctx.envDefault.cudnnLibPath}:''${LD_LIBRARY_PATH:-}"
-                export ONNX_TEST_MODEL="${ctx.squeezenet-model}"
-                echo "=== Static CUDA Backtrace (auto-interrupt after ''${DELAY}s) ==="
-                echo ""
-
-                # Self-interrupt technique: fork a process that sends SIGINT after delay
-                SELF=$$
-                ( sleep "$DELAY" ; kill -INT $SELF ) &
-                KILLER=$!
-
-                ${pkgs.gdb}/bin/gdb \
-                  -ex "set pagination off" \
-                  -ex "run" \
-                  -ex "bt" \
-                  -ex "thread apply all bt" \
-                  -ex "quit" \
-                  "${ctx.ortWrapperDefault}/bin/ort-wrapper"
-
-                kill $KILLER 2>/dev/null || true
-              '';
-            in
-            {
-              type = "app";
-              program = "${wrapper}/bin/debug-ort-bt";
-            };
-
-          # Debug: interactive GDB session
-          debug-gdb =
-            let
-              wrapper = pkgs.writeShellScriptBin "debug-ort-gdb" ''
-                export LD_LIBRARY_PATH="${ctx.envDefault.cudnnLibPath}:''${LD_LIBRARY_PATH:-}"
-                export ONNX_TEST_MODEL="${ctx.squeezenet-model}"
-                echo "=== Static CUDA Debug Session ==="
-                echo "When it hangs, press Ctrl+C then type:"
-                echo "  bt        - show backtrace"
-                echo "  bt full   - show backtrace with locals"
-                echo "  info threads - list all threads"
-                echo "  thread N  - switch to thread N"
-                echo ""
-                exec ${pkgs.gdb}/bin/gdb -ex "set pagination off" -ex run --args "${ctx.ortWrapperDefault}/bin/ort-wrapper" "$@"
-              '';
-            in
-            {
-              type = "app";
-              program = "${wrapper}/bin/debug-ort-gdb";
-            };
-
-          # Build monitor: reliable build output capture
-          # Usage: nix run .#build-cuda
-          # Captures --print-build-logs and stderr to show real progress
-          build-cuda =
-            let
-              wrapper = pkgs.writeShellScriptBin "build-cuda" ''
-                echo "=== Building Static CUDA (with logs) ==="
-                echo "Using: nix build .#ort-wrapper-cuda --print-build-logs 2>&1"
-                echo ""
-                exec ${pkgs.nix}/bin/nix build ${builtins.toString ./.}#ort-wrapper-cuda --print-build-logs 2>&1
-              '';
-            in
-            {
-              type = "app";
-              program = "${wrapper}/bin/build-cuda";
-            };
         }
         // ctx.lib.optionalAttrs ctx.isDarwin {
           ort-wrapper-coreml = ctx.mkApp {
@@ -988,83 +884,10 @@
         }
       );
 
-      # Debug tools for static CUDA hang investigation
-      debug = forEachSystem (
-        { pkgs, system }:
-        let
-          ctx = mkSystemContext { inherit pkgs system; };
-        in
-        ctx.lib.optionalAttrs ctx.isLinux {
-          # Run static CUDA wrapper under strace to see syscalls
-          # Usage: nix run .#debug.strace-cuda
-          strace-cuda =
-            let
-              wrapper = pkgs.writeShellScriptBin "debug-ort-strace" ''
-                export LD_LIBRARY_PATH="${ctx.envDefault.cudnnLibPath}:''${LD_LIBRARY_PATH:-}"
-                export ONNX_TEST_MODEL="${ctx.squeezenet-model}"
-                echo "=== Static CUDA Strace Session ==="
-                echo "Tracing syscalls (futex calls highlighted)..."
-                echo ""
-                exec ${pkgs.strace}/bin/strace -f -e trace=futex,write,nanosleep,clock_nanosleep \
-                  "${ctx.ortWrapperDefault}/bin/ort-wrapper" "$@" 2>&1 | head -500
-              '';
-            in
-            {
-              type = "app";
-              program = "${wrapper}/bin/debug-ort-strace";
-            };
-
-          # Run static CUDA wrapper under perf to sample where it's spinning
-          # Usage: nix run .#debug.perf-cuda
-          perf-cuda =
-            let
-              wrapper = pkgs.writeShellScriptBin "debug-ort-perf" ''
-                export LD_LIBRARY_PATH="${ctx.envDefault.cudnnLibPath}:''${LD_LIBRARY_PATH:-}"
-                export ONNX_TEST_MODEL="${ctx.squeezenet-model}"
-                echo "=== Static CUDA Perf Session ==="
-                echo "Recording for 5 seconds (Ctrl+C to stop early)..."
-                echo "Then run: perf report"
-                echo ""
-                ${pkgs.linuxPackages.perf}/bin/perf record -g --call-graph dwarf -o perf.data -- \
-                  timeout 5 "${ctx.ortWrapperDefault}/bin/ort-wrapper" "$@" || true
-                echo ""
-                echo "Perf data saved to perf.data"
-                echo "Run: ${pkgs.linuxPackages.perf}/bin/perf report -i perf.data"
-              '';
-            in
-            {
-              type = "app";
-              program = "${wrapper}/bin/debug-ort-perf";
-            };
-
-          # Quick spin detector - samples /proc/pid/stack repeatedly
-          spin-cuda =
-            let
-              wrapper = pkgs.writeShellScriptBin "debug-ort-spin" ''
-                export LD_LIBRARY_PATH="${ctx.envDefault.cudnnLibPath}:''${LD_LIBRARY_PATH:-}"
-                export ONNX_TEST_MODEL="${ctx.squeezenet-model}"
-                echo "=== Static CUDA Spin Detector ==="
-                echo "Starting wrapper in background, sampling stack..."
-                echo ""
-                "${ctx.ortWrapperDefault}/bin/ort-wrapper" "$@" &
-                PID=$!
-                sleep 0.5
-                for i in 1 2 3 4 5; do
-                  echo "--- Sample $i (PID $PID) ---"
-                  cat /proc/$PID/stack 2>/dev/null || echo "(process exited)"
-                  sleep 0.5
-                done
-                kill $PID 2>/dev/null || true
-              '';
-            in
-            {
-              type = "app";
-              program = "${wrapper}/bin/debug-ort-spin";
-            };
-
-        }
-      );
-
       formatter = forEachSystem ({ pkgs, ... }: pkgs.nixfmt-rfc-style);
+
+      lib = {
+        inherit mkOnnxruntime mkOrtWrapperEnv;
+      };
     };
 }

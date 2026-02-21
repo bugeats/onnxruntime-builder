@@ -4,16 +4,15 @@
 //! ort-sys is configured with `alternative-backend` feature which disables its linking.
 //!
 //! Required environment variables:
-//! - ORT_LIB_LOCATION: Path to directory containing libonnxruntime.a (static builds)
+//! - ORT_LIB_LOCATION: Path to directory containing libonnxruntime.a
 //!   Note: This name is an `ort` crate convention, not ours. See https://ort.pyke.io/setup/linking
-//! - ORT_DYLIB_PATH: Path to directory containing libonnxruntime.so (cuda-dyn builds)
 //!
 //! Optional environment variables:
-//! - CUDNN_LIB_PATH: Path to cuDNN shared libraries (Linux with cuda feature only)
+//! - CUDNN_LIB_PATH: Path to cuDNN shared libraries (Linux with static cuda only)
 //!
 //! Feature flags:
-//! - cuda: Enable static CUDA linking (Linux only)
-//! - cuda-dyn: Enable dynamic CUDA linking via libonnxruntime.so (Linux only)
+//! - cuda: Static CUDA linking (libonnxruntime.a includes CUDA providers)
+//! - cuda-dlopen: Hybrid mode — static core, CUDA providers load at runtime via dlopen
 //! - coreml: Enable CoreML linking (macOS only)
 //!
 //! Nix integration:
@@ -21,42 +20,6 @@
 
 use std::env;
 use std::path::PathBuf;
-
-/// Shared library handles all internal dependencies — much simpler than static
-#[cfg(all(target_os = "linux", feature = "cuda-dyn"))]
-fn link_cuda_dynamic() {
-    println!("cargo:rerun-if-env-changed=ORT_DYLIB_PATH");
-    println!("cargo:rerun-if-env-changed=CUDNN_LIB_PATH");
-
-    let lib_dir = env::var("ORT_DYLIB_PATH")
-        .expect("ORT_DYLIB_PATH must be set for cuda-dyn feature");
-    let lib_path = PathBuf::from(&lib_dir);
-
-    let dylib = lib_path.join("libonnxruntime.so");
-    if !dylib.exists() {
-        panic!(
-            "libonnxruntime.so not found at {:?}\n\
-             Make sure ORT_DYLIB_PATH points to the shared library directory",
-            dylib
-        );
-    }
-
-    println!("cargo:rustc-link-search=native={}", lib_dir);
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir);
-    println!("cargo:rustc-link-lib=dylib=onnxruntime");
-
-    let cudnn_path = lib_path.join("cudnn");
-    if cudnn_path.exists() {
-        println!("cargo:rustc-link-search=native={}", cudnn_path.display());
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", cudnn_path.display());
-    }
-    if let Ok(cudnn_env) = env::var("CUDNN_LIB_PATH") {
-        println!("cargo:rustc-link-search=native={}", cudnn_env);
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", cudnn_env);
-    }
-
-    println!("cargo:rustc-link-lib=stdc++");
-}
 
 /// Discover abseil static libraries from ORT_LIB_LOCATION at build time.
 /// The directory is the single source of truth — no hardcoded list to maintain.
@@ -78,12 +41,6 @@ fn find_abseil_libs(lib_dir: &str) -> Vec<PathBuf> {
 }
 
 fn main() {
-    #[cfg(all(target_os = "linux", feature = "cuda-dyn"))]
-    {
-        link_cuda_dynamic();
-        return;
-    }
-
     println!("cargo:rerun-if-env-changed=ORT_LIB_LOCATION");
     println!("cargo:rerun-if-env-changed=CUDNN_LIB_PATH");
     println!("cargo:rerun-if-env-changed=NIX_LDFLAGS");
@@ -112,14 +69,15 @@ fn main() {
         }
     }
 
-    // Static patching creates duplicate symbols between CUDA provider and provider bridge
-    #[cfg(feature = "cuda")]
+    // Static CUDA patching creates duplicate symbols — not needed in hybrid/dlopen mode
+    #[cfg(all(feature = "cuda", not(feature = "cuda-dlopen")))]
     println!("cargo:rustc-link-arg=-Wl,--allow-multiple-definition");
 
     println!("cargo:rustc-link-lib=static=onnxruntime");
 
     // Resolves __cudaRegisterLinkedBinary_* from separable compilation (-dc)
-    #[cfg(feature = "cuda")]
+    // Only needed when CUDA objects are in the static archive
+    #[cfg(all(feature = "cuda", not(feature = "cuda-dlopen")))]
     {
         let dlink_obj = lib_path.join("cuda_device_link.o");
         if dlink_obj.exists() {
@@ -160,14 +118,16 @@ fn link_linux(lib_path: &PathBuf) {
     // clog is built into cpuinfo in nixpkgs
     println!("cargo:rustc-link-lib=static=cpuinfo");
 
-    #[cfg(feature = "cuda")]
+    // Static CUDA: link CUDA libraries directly (not used in hybrid/dlopen mode)
+    #[cfg(all(feature = "cuda", not(feature = "cuda-dlopen")))]
     link_cuda(lib_path);
 
-    #[cfg(not(feature = "cuda"))]
     let _ = lib_path;
 }
 
-#[cfg(all(target_os = "linux", feature = "cuda"))]
+/// Link CUDA libraries statically. Only for fully-static CUDA builds —
+/// hybrid mode loads these at runtime via the CUDA provider .so.
+#[cfg(all(target_os = "linux", feature = "cuda", not(feature = "cuda-dlopen")))]
 fn link_cuda(lib_path: &PathBuf) {
     // cuDNN: dynamic only — static linking has performance penalties
     let cudnn_bundled = lib_path.join("cudnn");

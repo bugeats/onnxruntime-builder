@@ -9,7 +9,7 @@
 //! Accelerators are selected at compile time:
 //! - `cuda` — CUDA execution provider (Linux)
 //! - `coreml` — CoreML execution provider (macOS)
-//! - `cuda-dyn` — dynamic CUDA via `libonnxruntime.so`
+//! - `cuda-dlopen` — CUDA providers loaded via dlopen at runtime
 //! - *(none)* — CPU-only
 //!
 //! # Quick Start
